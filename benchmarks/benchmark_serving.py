@@ -15,8 +15,8 @@
 """Benchmark JetStream online serving.
 
 On the server side, run one of the following commands:
-    * For real server, you need to pass correct server config (include the model config that 
-      being passed into your engine impl) to the command below. Refer to config_lib.py and 
+    * For real server, you need to pass correct server config (include the model config that
+      being passed into your engine impl) to the command below. Refer to config_lib.py and
       implementations/mock/config.py for config impl detail.
 
     (run with real server)
@@ -28,7 +28,7 @@ On the server side, run one of the following commands:
 
 On the client side, run:
     * For real server and shareGPT dataset, you need to pass the tokenizer, server config, and
-      dataset flags to the command below, and make some changes to the tokenizer logic in the 
+      dataset flags to the command below, and make some changes to the tokenizer logic in the
       benchmark script (get_tokenizer and sample_requests func) to use your tokenizer correctly.
     * Add `--save-result` flag to save the benchmark result to a json file in current folder.
     * Add `--threads` flag to set the maximum number of threads used for request dispatching.
@@ -42,7 +42,7 @@ On the client side, run:
     python -m benchmarks.benchmark_serving \
         --request-rate 1
 
-e2e example: python3 benchmark_serving.py --tokenizer /home/rwitten/maxtext/assets/tokenizer --num-prompts 100  --dataset ~/ShareGPT_V3_unfiltered_cleaned_split.json 
+e2e example: python3 benchmark_serving.py --tokenizer /home/rwitten/maxtext/assets/tokenizer --num-prompts 100  --dataset ~/ShareGPT_V3_unfiltered_cleaned_split.json
 """
 
 
@@ -99,7 +99,7 @@ class RequestFuncOutput:
   prompt_len: int = 0
 
   # Flatten the structure and return only the necessary results
-  def to_dict(self): 
+  def to_dict(self):
     return {
       "prompt": self.input_request.prompt,
       "original_output": self.input_request.output,
@@ -107,7 +107,7 @@ class RequestFuncOutput:
       "success": self.success,
       "latency": self.latency,
       "prompt_len": self.prompt_len
-    }  
+    }
 
 
 def get_tokenizer(tokenizer_name: str) -> Any:
@@ -121,7 +121,7 @@ def get_tokenizer(tokenizer_name: str) -> Any:
         model=sp_model, add_bos=True, add_eos=False, reverse=False)
     return sp_tokenizer
 
-def sample_requests(
+def load_sharegpt_dataset(
     dataset_path: str,
     num_requests: int,
     tokenizer: Any,
@@ -189,6 +189,50 @@ def sample_requests(
   # Sample the requests.
   sampled_requests = random.sample(filtered_dataset, num_requests)
   return sampled_requests
+
+
+def load_openorca_dataset(
+    dataset_path: str,
+    tokenizer: Any,
+    max_output_length: int = None,
+) -> List[InputRequest]:
+
+  # Load the dataset.
+  with open(dataset_path) as f:
+    dataset = json.load(f)
+
+  # Tokenize the prompts and completions.
+  prompts = dataset["prompts"]
+  outputs = dataset["results"]
+  n = len(prompts)
+  prompt_token_ids = tokenizer.tokenize(prompts)
+  output_token_ids = tokenizer.tokenize(outputs)
+
+  tokenized_dataset = []
+  for i in range(n):
+    output_len = len(output_token_ids[i])
+    tokenized_dataset.append((prompts[i], prompt_token_ids[i], outputs[i], output_len))
+
+  # Filter out too long sequences.
+  filtered_dataset: List[InputRequest] = []
+
+  for prompt, prompt_token_ids, output, output_len in tokenized_dataset:
+    prompt_len = len(prompt_token_ids)
+    if prompt_len > 1024 or prompt_len + output_len > 2048:
+      # Prune too long sequences.
+      continue
+    request = InputRequest(prompt, prompt_len, output, max_output_length or output_len)
+    filtered_dataset.append(request)
+
+  if max_output_length is None:
+    print("In InputRequest, pass in actual output_length for each sample")
+  else:
+    print("In InputRequest, pass in max_output_length: {max_output_length} for each sample")
+
+  print(f"The dataset contains {len(dataset)} samples.")
+  print(f"The filtered dataset contains {len(filtered_dataset)} samples.")
+
+  return filtered_dataset
 
 
 async def get_request(
@@ -396,7 +440,7 @@ def sample_warmup_requests(requests):
         256,
         512,
         1024,]
-  
+
   for start, end in zip(interesting_buckets[:-1], interesting_buckets[1:]):
     for request in requests:
       if start < request.prompt_len <= end:
@@ -417,11 +461,18 @@ def main(args: argparse.Namespace):
   tokenizer = get_tokenizer(tokenizer_id)
   if tokenizer == "test" or args.dataset == "test":
     input_requests = mock_requests(args.total_mock_requests) # e.g. [("AB", 2, "AB", 3)]
-  else:
-    input_requests = sample_requests(
-      args.dataset, 
-      args.num_prompts, 
-      tokenizer, 
+  elif args.dataset == "openorca":
+    # Here we load the openorca dataset of its calibration version from mlperf
+    input_requests = load_openorca_dataset(
+      args.dataset_path,
+      tokenizer,
+      args.max_output_length,
+    )
+  elif args.dataset == "sharegpt":
+    input_requests = load_sharegpt_dataset(
+      args.dataset_path,
+      args.num_prompts,
+      tokenizer,
       args.max_output_length,
       args.conversation_starter,
     )
@@ -486,7 +537,7 @@ def main(args: argparse.Namespace):
   if args.save_request_outputs:
     file_path = args.request_outputs_file_path
     with open(file_path, "w") as output_file:
-        json.dump([output.to_dict() for output in request_outputs], output_file, indent=4) 
+        json.dump([output.to_dict() for output in request_outputs], output_file, indent=4)
 
 
 if __name__ == "__main__":
@@ -501,7 +552,10 @@ if __name__ == "__main__":
   )
   parser.add_argument("--port", type=str, default=9000)
   parser.add_argument(
-      "--dataset", type=str, default="test", help="Path to the dataset."
+      "--dataset", type=str, default="test", choices=["test", "sharegpt", "openorca"], help="The dataset name."
+  )
+  parser.add_argument(
+      "--dataset-path", type=str, help="Path to the dataset."
   )
   parser.add_argument(
       "--model",
